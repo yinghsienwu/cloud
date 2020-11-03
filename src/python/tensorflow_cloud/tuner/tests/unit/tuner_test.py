@@ -25,10 +25,11 @@ from kerastuner.engine import tuner as super_tuner
 import mock
 
 import tensorflow as tf
+from tensorboard.plugins.hparams import api as hparams_api
 from tensorflow_cloud.core import deploy
 from tensorflow_cloud.core import machine_config
 from tensorflow_cloud.core import validate
-from tensorflow_cloud.experimental.cloud_fit import client
+from tensorflow_cloud.tuner import cloud_fit_client
 from tensorflow_cloud.tuner import tuner
 from tensorflow_cloud.tuner.tuner import optimizer_client
 from tensorflow_cloud.utils import google_api_client
@@ -125,9 +126,10 @@ class CloudTunerTest(tf.test.TestCase):
                 objective,
                 hyperparameters,
                 study_config,
-                directory="gs://remote_dir",
+                directory=None,
                 max_trials=None
                 ):
+        directory = directory or self._remote_dir
         return tuner.DistributingCloudTuner(
             hypermodel=build_model,
             objective=objective,
@@ -237,7 +239,7 @@ class CloudTunerTest(tf.test.TestCase):
         trial = self.tuner.oracle.create_trial("tuner_0")
 
         self.mock_client.list_trials.assert_called_once()
-        self.assertIsNone(trial.hyperparameters.values)
+        self.assertEqual(trial.hyperparameters.values, {})
         self.assertEqual(trial.status, trial_module.TrialStatus.STOPPED)
 
     def test_create_trial_after_early_stopping(self):
@@ -248,7 +250,7 @@ class CloudTunerTest(tf.test.TestCase):
         trial = self.tuner.oracle.create_trial("tuner_0")
 
         self.mock_client.list_trials.assert_called_once()
-        self.assertIsNone(trial.hyperparameters.values)
+        self.assertEqual(trial.hyperparameters.values, {})
         self.assertEqual(trial.status, trial_module.TrialStatus.STOPPED)
 
     def test_update_trial(self):
@@ -316,6 +318,35 @@ class CloudTunerTest(tf.test.TestCase):
         self.tuner.oracle.ongoing_trials = {"tuner_0": self._test_trial}
         with self.assertRaises(ValueError):
             self.tuner.oracle.end_trial(trial_id="1", status="FOO")
+
+    def test_get_trial_success(self):
+        self._tuner_with_hparams()
+        self.mock_client.get_trial.return_value = {
+            "name": "1",
+            "state": "COMPLETED",
+            "parameters": [{"parameter": "learning_rate", "floatValue": 0.01}],
+            "finalMeasurement": {
+                "stepCount": 3,
+                "metrics": [{"metric": "val_acc", "value": 0.7}],
+            },
+            "trial_infeasible": False,
+            "infeasible_reason": None,
+        }
+        trial = self.tuner.oracle.get_trial(trial_id="1")
+        self.mock_client.get_trial.assert_called_once_with("1")
+        self.assertEqual(trial.trial_id, "1")
+        self.assertEqual(trial.score, 0.7)
+        self.assertEqual(trial.status, trial_module.TrialStatus.COMPLETED)
+        self.assertEqual(trial.hyperparameters.values, {"learning_rate": 0.01})
+
+    def test_get_trial_failed(self):
+        self._tuner_with_hparams()
+        self.mock_client.get_trial.return_value = {
+            "name": "1",
+            "state": "FOO"
+        }
+        with self.assertRaises(ValueError):
+            self.tuner.oracle.get_trial(trial_id="1")
 
     def test_get_best_trials(self):
         self._tuner_with_hparams()
@@ -428,19 +459,66 @@ class CloudTunerTest(tf.test.TestCase):
         self.assertEqual(best_trials_1[0].best_step, 3)
 
     @mock.patch.object(super_tuner.Tuner, "__init__", auto_spec=True)
-    def test_add_tensorboard_callback(self, mock_super_tuner):
+    @mock.patch.object(tf.summary, "create_file_writer", auto_spec=True)
+    @mock.patch.object(hparams_api, "hparams", auto_spec=True)
+    def test_add_logging_user_specified(
+        self, mock_hparams, mock_create_file_writer, mock_super_tuner):
         remote_tuner = self._remote_tuner(None, None, self._study_config)
 
-        callbacks = [
-            tf.keras.callbacks.TensorBoard(log_dir="user_defined_path_1"),
-            tf.keras.callbacks.TensorBoard(log_dir="user_defined_path_2")]
+        callbacks = [tf.keras.callbacks.TensorBoard(
+            log_dir=remote_tuner.directory,
+            write_images=True)]
 
-        trial_id = "test_trial_id"
-        remote_tuner._add_tensorboard_callback(callbacks, trial_id)
+        remote_tuner._add_logging(callbacks, self._test_trial)
+
+        expected_logdir = os.path.join(
+            remote_tuner.directory, self._test_trial.trial_id, "logs")
+        expected_hparams = {hparams_api.HParam(
+            "learning_rate", hparams_api.Discrete([1e-4, 1e-3, 1e-2])): 1e-4}
+
         self.assertLen(callbacks, 1)
+        self.assertEqual(callbacks[0].log_dir, expected_logdir)
+        self.assertEqual(callbacks[0].write_images, True)
+        mock_create_file_writer.assert_called_once_with(expected_logdir)
+        self.assertEqual(mock_hparams.call_count, 1)
         self.assertEqual(
-            callbacks[0].log_dir,
-            os.path.join(remote_tuner.directory, trial_id, "logs"))
+            repr(mock_hparams.call_args[0][0]), repr(expected_hparams))
+
+    @mock.patch.object(super_tuner.Tuner, "__init__", auto_spec=True)
+    @mock.patch.object(tf.summary, "create_file_writer", auto_spec=True)
+    @mock.patch.object(hparams_api, "hparams", auto_spec=True)
+    def test_add_logging_not_specified(
+        self, mock_hparams, mock_create_file_writer, mock_super_tuner):
+        remote_tuner = self._remote_tuner(None, None, self._study_config)
+
+        callbacks = []
+        remote_tuner._add_logging(callbacks, self._test_trial)
+
+        expected_logdir = os.path.join(
+            remote_tuner.directory, self._test_trial.trial_id, "logs")
+
+        self.assertLen(callbacks, 1)
+        self.assertEqual(callbacks[0].log_dir, expected_logdir)
+        mock_create_file_writer.assert_not_called()
+        mock_hparams.assert_not_called()
+
+    @mock.patch.object(super_tuner.Tuner, "__init__", auto_spec=True)
+    @mock.patch.object(tf.summary, "create_file_writer", auto_spec=True)
+    @mock.patch.object(hparams_api, "hparams", auto_spec=True)
+    def test_add_logging_mismatched_dir(
+        self, mock_hparams, mock_create_file_writer, mock_super_tuner):
+        remote_tuner = self._remote_tuner(None, None, self._study_config)
+
+        callbacks = [tf.keras.callbacks.TensorBoard(
+            log_dir=os.path.join(remote_tuner.directory, "logs"))]
+
+        with self.assertRaisesRegex(
+            ValueError, "log_dir in TensorBoard callback should be "
+                        "gs://remote_dir, but was gs://remote_dir/logs"):
+            remote_tuner._add_logging(callbacks, self._test_trial)
+
+        mock_create_file_writer.assert_not_called()
+        mock_hparams.assert_not_called()
 
     @mock.patch.object(super_tuner.Tuner, "__init__", auto_spec=True)
     def test_add_model_checkpoint_callback(self, mock_super_tuner):
@@ -453,7 +531,7 @@ class CloudTunerTest(tf.test.TestCase):
             callbacks[0].filepath,
             os.path.join(remote_tuner.directory, trial_id, "checkpoint"))
 
-    @mock.patch.object(client, "cloud_fit", auto_spec=True)
+    @mock.patch.object(cloud_fit_client, "cloud_fit", auto_spec=True)
     @mock.patch.object(google_api_client,
                        "wait_for_api_training_job_completion", auto_spec=True)
     @mock.patch.object(super_tuner.Tuner, "__init__", auto_spec=True)
@@ -461,8 +539,9 @@ class CloudTunerTest(tf.test.TestCase):
                        auto_spec=True)
     @mock.patch.object(tf_utils, "get_tensorboard_log_watcher_from_path",
                        auto_spec=True)
+    @mock.patch.object(tf.io.gfile, "makedirs", auto_spec=True)
     def test_remote_run_trial_with_successful_job(
-        self, mock_log_watcher, mock_is_running, mock_super_tuner,
+        self, mock_tf_io, mock_log_watcher, mock_is_running, mock_super_tuner,
         mock_job_status, mock_cloud_fit):
         remote_tuner = self._remote_tuner(
             None, None, self._study_config, max_trials=10)
@@ -495,21 +574,23 @@ class CloudTunerTest(tf.test.TestCase):
             image_uri=self._container_uri,
             job_id=self._job_id)
 
-        log_path = remote_tuner._get_tensorboard_log_dir(
-            self._test_trial.trial_id)
+        log_path = os.path.join(remote_tuner._get_tensorboard_log_dir(
+            self._test_trial.trial_id), "train")
         mock_log_watcher.assert_called_with(log_path)
         self.assertEqual(
             2, remote_tuner._get_remote_training_metrics.call_count)
+        mock_tf_io.assert_called_with(log_path)
 
-    @mock.patch.object(client, "cloud_fit", auto_spec=True)
+    @mock.patch.object(cloud_fit_client, "cloud_fit", auto_spec=True)
     @mock.patch.object(google_api_client,
                        "wait_for_api_training_job_completion", auto_spec=True)
     @mock.patch.object(super_tuner.Tuner, "__init__", auto_spec=True)
     @mock.patch.object(google_api_client, "is_api_training_job_running",
                        auto_spec=True)
+    @mock.patch.object(tf.io.gfile, "makedirs", auto_spec=True)
     def test_remote_run_trial_with_failed_job(
-        self, mock_is_running, mock_super_tuner,
-        mock_job_status, mock_cloud_fit):
+        self, mock_tf_io, mock_is_running, mock_super_tuner, mock_job_status,
+        mock_cloud_fit):
 
         remote_tuner = self._remote_tuner(
             None, None, self._study_config, max_trials=10)
@@ -525,14 +606,15 @@ class CloudTunerTest(tf.test.TestCase):
 
     @mock.patch.object(google_api_client, "stop_aip_training_job",
                        auto_spec=True)
-    @mock.patch.object(client, "cloud_fit", auto_spec=True)
+    @mock.patch.object(cloud_fit_client, "cloud_fit", auto_spec=True)
     @mock.patch.object(google_api_client,
                        "wait_for_api_training_job_completion", auto_spec=True)
     @mock.patch.object(super_tuner.Tuner, "__init__", auto_spec=True)
     @mock.patch.object(google_api_client, "is_api_training_job_running",
                        auto_spec=True)
+    @mock.patch.object(tf.io.gfile, "makedirs", auto_spec=True)
     def test_remote_run_trial_with_oracle_canceling_job(
-        self, mock_is_running, mock_super_tuner,
+        self, mock_tf_io, mock_is_running, mock_super_tuner,
         mock_job_status, mock_cloud_fit, mock_stop_job):
 
         remote_tuner = self._remote_tuner(
@@ -578,7 +660,7 @@ class CloudTunerTest(tf.test.TestCase):
         log_reader = tf_utils.get_tensorboard_log_watcher_from_path(log_dir)
         results = remote_tuner._get_remote_training_metrics(log_reader, {})
 
-        self.assertLen(results.completed_epoch_metrics, 3)
+        self.assertLen(results.completed_epoch_metrics, 2)
         self.assertIn("accuracy", results.completed_epoch_metrics[0])
         self.assertIn("loss", results.completed_epoch_metrics[0])
         self.assertEqual(

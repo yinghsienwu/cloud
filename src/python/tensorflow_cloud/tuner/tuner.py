@@ -28,10 +28,11 @@ from kerastuner.engine import trial as trial_module
 from kerastuner.engine import tuner as tuner_module
 import tensorflow as tf
 
+from tensorboard.plugins.hparams import api as hparams_api
 from tensorflow_cloud.core import deploy
 from tensorflow_cloud.core import machine_config
 from tensorflow_cloud.core import validate
-from tensorflow_cloud.experimental.cloud_fit import client
+from tensorflow_cloud.tuner import cloud_fit_client
 from tensorflow_cloud.tuner import optimizer_client
 from tensorflow_cloud.tuner import utils
 from tensorflow_cloud.utils import google_api_client
@@ -44,6 +45,9 @@ _POLLING_INTERVAL_IN_SECONDS = 30
 # metrics from remote training Tensorboard logs during training with:
 # - 'completed_epoch_metrics'- a list of epoch metrics for completed epochs.
 # - 'partial_epoch_metrics' - Any incomplete epoch metrics for the last epoch.
+#   If training has completed this will contain metrics for the final epoch of
+#   training.
+
 _TrainingMetrics = collections.namedtuple("_TrainingMetrics", [
     "completed_epoch_metrics", "partial_epoch_metrics"])
 
@@ -164,7 +168,7 @@ class CloudOracle(oracle_module.Oracle):
             len(trial_list) >= self.max_trials) or stopping_trials:
             trial_id = "n"
             hyperparameters = self.hyperparameters.copy()
-            hyperparameters.values = None
+            hyperparameters.values = {}
             # This will break the search loop later.
             return trial_module.Trial(
                 hyperparameters=hyperparameters,
@@ -281,13 +285,29 @@ class CloudOracle(oracle_module.Oracle):
 
         if status == trial_module.TrialStatus.COMPLETED:
             final_measurement = optimizer_trial["finalMeasurement"]
-            # If epoch = 1, set the best_step = 1.
+            # If epochs = 1, set the best_step = 0.
             kerastuner_trial.best_step = int(
-                final_measurement.get("stepCount", 1))
+                final_measurement.get("stepCount", 0))
             kerastuner_trial.score = final_measurement["metrics"][0].get(
                 "value")
         self._save_trial(kerastuner_trial)
         self.save()
+
+    def get_trial(self, trial_id: Text) -> trial_module.Trial:
+        """Returns a completed KerasTuner Trial given the trial_id."""
+        # Note that this is called in Tuner.on_trial_end.
+
+        optimizer_trial = self.service.get_trial(trial_id)
+
+        if optimizer_trial["state"] != "COMPLETED":
+            raise ValueError("The trial status is not COMPLETED, found {}"
+                             .format(optimizer_trial["state"]))
+
+        # Convert a completed Optimizer trial to KerasTuner Trial instance.
+        kerastuner_trial = utils.convert_optimizer_trial_to_keras_trial(
+            optimizer_trial,
+            self.hyperparameters.copy())
+        return kerastuner_trial
 
     def get_best_trials(self, num_trials: int = 1) -> List[trial_module.Trial]:
         """Returns the trials with the best objective values found so far.
@@ -322,20 +342,11 @@ class CloudOracle(oracle_module.Oracle):
         best_optimizer_trials = sorted_trials[:num_trials]
 
         best_trials = []
-        # Convert Optimizer trials to KerasTuner Trial instance
+        # Convert completed Optimizer trials to KerasTuner Trial instances.
         for optimizer_trial in best_optimizer_trials:
-            final_measurement = optimizer_trial["finalMeasurement"]
-            kerastuner_trial = trial_module.Trial(
-                hyperparameters=utils.convert_optimizer_trial_to_hps(
-                    self.hyperparameters.copy(), optimizer_trial
-                ),
-                trial_id=utils.get_trial_id(optimizer_trial),
-                status=trial_module.TrialStatus.COMPLETED,
-            )
-            # If trial had ended before having intermediate metric reporting,
-            # set epoch = 1.
-            kerastuner_trial.best_step = final_measurement.get("stepCount", 1)
-            kerastuner_trial.score = final_measurement["metrics"][0]["value"]
+            kerastuner_trial = utils.convert_optimizer_trial_to_keras_trial(
+                optimizer_trial,
+                self.hyperparameters.copy())
             best_trials.append(kerastuner_trial)
         return best_trials
 
@@ -485,8 +496,8 @@ class DistributingCloudTuner(tuner_module.Tuner):
         super(DistributingCloudTuner, self,).__init__(
             oracle=oracle, hypermodel=hypermodel, **kwargs
         )
-        # If study id is not provided cloud_oracle creates ones. Setting the
-        # study_id based on cloud oracles logic to ensure they are the same.
+        # If study_id is not provided, CloudOracle creates one. Setting the
+        # study_id to what CloudOracle generates, to ensure they are the same.
         self._study_id = oracle.study_id
         self.directory = directory
 
@@ -512,16 +523,15 @@ class DistributingCloudTuner(tuner_module.Tuner):
         callbacks = fit_kwargs.pop("callbacks", [])
         callbacks = self._deepcopy_callbacks(callbacks)
 
-        # Note run_trial does not use `TunerCallback` calls, since
+        # Note: run_trial does not use `TunerCallback` calls, since
         # training is performed on AI Platform training remotely.
 
-        # Creating a tensorboard callback with log-dir path specific for this
-        # trail_id. The tensorboard logs are used for passing metrics back from
-        # remote execution.
-        self._add_tensorboard_callback(callbacks, trial.trial_id)
+        # Handle TensorBoard/hyperparameter logging here. The TensorBoard
+        # logs are used for passing metrics back from remote execution.
+        self._add_logging(callbacks, trial)
 
         # Creating a save_model checkpoint callback with a saved model file path
-        # specific to this trial, this is to prevent different trials from
+        # specific to this trial. This is to prevent different trials from
         # overwriting each other.
         self._add_model_checkpoint_callback(
             callbacks, trial.trial_id)
@@ -548,7 +558,7 @@ class DistributingCloudTuner(tuner_module.Tuner):
             "job_spec": job_spec,
             "**copied_fit_kwargs": copied_fit_kwargs})
 
-        client.cloud_fit(
+        cloud_fit_client.cloud_fit(
             model=model,
             remote_dir=remote_dir,
             region=self._region,
@@ -561,7 +571,11 @@ class DistributingCloudTuner(tuner_module.Tuner):
 
         # Create an instance of tensorboard DirectoryWatcher to retrieve the
         # logs for this trial run
-        log_path = self._get_tensorboard_log_dir(trial.trial_id)
+        log_path = os.path.join(
+            self._get_tensorboard_log_dir(trial.trial_id), "train")
+
+        # Tensorboard log watcher expects the path to exist
+        tf.io.gfile.makedirs(log_path)
 
         # TODO(b/170687807) Switch from using "{}".format() to f-string
         tf.get_logger().info(
@@ -583,11 +597,12 @@ class DistributingCloudTuner(tuner_module.Tuner):
 
             for epoch_metrics in training_metrics.completed_epoch_metrics:
                 # TODO(b/169197272) Validate metrics contain oracle objective
-                trial.status = self.oracle.update_trial(
-                    trial_id=trial.trial_id,
-                    metrics=epoch_metrics,
-                    step=epoch)
-                epoch += 1
+                if epoch_metrics:
+                    trial.status = self.oracle.update_trial(
+                        trial_id=trial.trial_id,
+                        metrics=epoch_metrics,
+                        step=epoch)
+                    epoch += 1
 
             if trial.status == "STOPPED":
                 google_api_client.stop_aip_training_job(
@@ -598,7 +613,9 @@ class DistributingCloudTuner(tuner_module.Tuner):
         if not google_api_client.wait_for_api_training_job_completion(
             job_id, self._project_id):
             raise RuntimeError(
-                "AIP Training job failed, see logs for details at https://console.cloud.google.com/ai-platform/jobs/{}/charts/cpu?project={}"  # pylint: disable=line-too-long
+                "AIP Training job failed, see logs for details at "
+                "https://console.cloud.google.com/ai-platform/jobs/"
+                "{}/charts/cpu?project={}"
                 .format(job_id, self._project_id))
 
         # Retrieve and report any remaining metrics
@@ -608,11 +625,19 @@ class DistributingCloudTuner(tuner_module.Tuner):
         for epoch_metrics in training_metrics.completed_epoch_metrics:
             # TODO(b/169197272) Validate metrics contain oracle objective
             # TODO(b/170907612) Support submit partial results to Oracle
+            if epoch_metrics:
+                self.oracle.update_trial(
+                    trial_id=trial.trial_id,
+                    metrics=epoch_metrics,
+                    step=epoch)
+                epoch += 1
+
+        # submit final epoch metrics
+        if training_metrics.partial_epoch_metrics:
             self.oracle.update_trial(
                 trial_id=trial.trial_id,
-                metrics=epoch_metrics,
+                metrics=training_metrics.partial_epoch_metrics,
                 step=epoch)
-            epoch += 1
 
     def _get_job_spec_from_config(self, job_id: Text) -> Dict[Text, Any]:
         """Creates a request dictionary for the CAIP training service.
@@ -650,7 +675,7 @@ class DistributingCloudTuner(tuner_module.Tuner):
         self,
         log_reader,
         partial_epoch_metrics: Dict[Text, float]
-        )-> _TrainingMetrics:
+        ) -> _TrainingMetrics:
         """Retrieves delta epoch metrics from tensorboard logs since last run.
 
         This method reports any complete epoch metrics that are available since
@@ -671,14 +696,16 @@ class DistributingCloudTuner(tuner_module.Tuner):
             - 'completed_epoch_metrics'- a list of epoch metrics for completed
                 epochs.
             - 'partial_epoch_metrics' - Any incomplete epoch metrics for the
-                last epoch.
+                last epoch. Once training completes, the final epoch metrics
+                will be stored here, this is not included in
+                completed_epoch_metrics.
         """
         completed_epoch_metrics = []
         for event in log_reader.Load():
             for value in event.summary.value:
-                # Note tf.keras.callbacks.TensorBoard() with update_freq="epoch"
-                # logs the epoch related metrics with a "epoch_" prefix. This is
-                # not a requirement by tensorboard.
+                # Note: tf.keras.callbacks.TensorBoard.on_epoch_end() logs the
+                # epoch related metrics with a "epoch_" prefix. Please refer to
+                # https://github.com/tensorflow/tensorflow/blob/fcc4b966f1265f466e82617020af93670141b009/tensorflow/python/keras/callbacks.py#L2179 # pylint: disable=line-too-long
                 if value.tag.startswith("epoch_"):
                     metric = value.tag.replace("epoch_", "")
                     # If we have already seen this metric, this is a new epoch
@@ -690,7 +717,6 @@ class DistributingCloudTuner(tuner_module.Tuner):
                     # the unrelated Objectives.
                     partial_epoch_metrics[metric] = tf.make_ndarray(
                         event.summary.value[0].tensor)
-        completed_epoch_metrics.append(partial_epoch_metrics)
         return _TrainingMetrics(completed_epoch_metrics, partial_epoch_metrics)
 
     def load_model(self, trial):
@@ -701,7 +727,6 @@ class DistributingCloudTuner(tuner_module.Tuner):
         raise NotImplementedError("load_model for remote run is not supported.")
 
     def save_model(self, trial_id: int, model, step: int = 0):
-
         # In remote execution models are saved automatically in Google Cloud
         # Storage (GCS) bucket hence no additional actions are needed to save
         # the model.
@@ -712,27 +737,58 @@ class DistributingCloudTuner(tuner_module.Tuner):
             filepath=self._get_model_checkpoint_dir(trial_id),
             save_freq="epoch"))
 
-    def _add_tensorboard_callback(self, callbacks, trial_id):
-        # due to https://github.com/keras-team/keras/issues/14223 multiple
-        # tensorboard callbacks are not supported. Removing user defined
-        # tf.keras.callbacks.TensorBoard callback.
+    def _add_logging(self, callbacks, trial):
+        """Add a TensorBoard callback if needed, otherwise log hyperparameters.
 
-        tf.get_logger().info(
-            "Only one tf.keras.callbacks.TensorBoard callback is allowed, removing user defined callbacks."  # pylint: disable=line-too-long
-            )
-        callbacks[:] = [
-            x for x in callbacks if x.__class__.__name__ != "TensorBoard"]
+        Note: Due to https://github.com/keras-team/keras/issues/14223, multiple
+        TensorBoard callbacks are not supported. If user specified a TensorBoard
+        callback, we treat it as an intent to log the metrics, and we shall
+        additionally log the hyperparameters as well. Otherwise, we'll add a
+        TensorBoard callback to pass back the epoch related metrics from
+        remote execution.
 
-        callbacks.append(tf.keras.callbacks.TensorBoard(
-            log_dir=self._get_tensorboard_log_dir(trial_id)))
+        Arguments:
+            callbacks: List of callbacks passed in to the search function.
+            trial: A `Trial` instance.
+        Raises:
+            ValueError: If TensorBoard callback's log_dir does not match
+            self.directory.
+        """
 
-    def _get_tensorboard_log_dir(self, trial_id)-> Text:
+        logdir = self._get_tensorboard_log_dir(trial.trial_id)
+        for callback in callbacks:
+            if callback.__class__.__name__ == "TensorBoard":
+                # Validate TensorBoard log_dir
+                if callback.log_dir != self.directory:
+                    # TODO(b/170687807) Switch from using .format() to f-string
+                    raise ValueError(
+                        "log_dir in TensorBoard callback should be {}, "
+                        "but was {}".format(self.directory, callback.log_dir)
+                    )
+                # Patch the log_dir
+                callback.log_dir = logdir
+                # Do hyperparameter logging here to avoid having to
+                # serialize/deserialize the hyperparameters if logged through
+                # passing hparams_api.KerasCallback to client.cloud_fit.
+                with tf.summary.create_file_writer(logdir).as_default():
+                    hparams_api.hparams(utils.convert_hyperparams_to_hparams(
+                        trial.hyperparameters))
+                # We're done here, since there should only be one TensorBoard
+                # callback
+                return
+
+        # TensorBoard callback not specified by user, add it here. The
+        # TensorBoard logs are used for passing metrics back from
+        # remote execution.
+        callbacks.append(tf.keras.callbacks.TensorBoard(log_dir=logdir))
+
+    def _get_tensorboard_log_dir(self, trial_id) -> Text:
         # Defining <directory>/<trial_id>/logs as log structure.
         # self._add_tensorboard_callback uses this directory structure to
         # configure the tf.keras.callbacks.TensorBoard() for each trial.
         return os.path.join(self.directory, str(trial_id), "logs")
 
-    def _get_model_checkpoint_dir(self, trial_id)->Text:
+    def _get_model_checkpoint_dir(self, trial_id) -> Text:
         # Defining <directory>/<trial_id>/checkpoint as checkpoint structure.
         # self._add_model_checkpoint_callback uses this directory structure to
         # configure the tf.keras.callbacks.ModelCheckpoint() for each trial.

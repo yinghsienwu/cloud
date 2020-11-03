@@ -90,7 +90,7 @@ def _dist_search_fn(temp_dir, study_id, tuner_id):
 
     # Jitter instantiation so as to avoid contention on study
     # creation and dataset download.
-    time.sleep(int(tuner_id[5:]))  # tuner_id is formatted as 'tuner%d'
+    time.sleep(int(tuner_id[5:]) * 20)  # tuner_id is formatted as 'tuner%d'
 
     # Dataset must be loaded independently in sub-process.
     (x, y), (val_x, val_y) = _load_data(temp_dir)
@@ -284,7 +284,7 @@ class CloudTunerIntegrationTest(_CloudTunerIntegrationTestBase):
         self._assert_output(
             tuner.search_space_summary,
             r".*Search space summary(?=.*learning_rate \(Choice\))"
-            r"(?=.*num_layers \(Int\))(?=.*units \(Choice\))",
+            r"(?=.*num_layers \(Int\))(?=.*units \(Int\))",
         )
 
         tuner.search(

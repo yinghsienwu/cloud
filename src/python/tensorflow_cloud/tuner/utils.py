@@ -19,7 +19,9 @@ from typing import Any, Dict, List, Optional, Text, Union
 from kerastuner.engine import hyperparameters as hp_module
 from kerastuner.engine import metrics_tracking
 from kerastuner.engine import oracle as oracle_module
+from kerastuner.engine import trial as trial_module
 import numpy as np
+from tensorboard.plugins.hparams import api as hparams_api
 
 # CAIP Optimizer constants.
 _DISCRETE = "DISCRETE"
@@ -116,7 +118,43 @@ def convert_study_config_to_hps(
         _is_parameter_valid(param)
         name = param["parameter"]
         if param["type"] == _DISCRETE:
-            hps.Choice(name, param["discrete_value_spec"]["values"])
+            values = param["discrete_value_spec"]["values"]
+            is_numeric = True
+            for v in values:
+                if not isinstance(v, (int, float)):
+                    is_numeric = False
+            if (
+                is_numeric and len(values) > 2 and
+                np.all(np.diff(values, 2) == 0)
+            ):
+                # If the numeric sequence is an arithmetic sequence, use
+                # Int/Float with step
+                is_int = True
+                for v in values:
+                    if not isinstance(v, int):
+                        is_int = False
+                hps_type = hps.Int if is_int else hps.Float
+
+                if (
+                    param.get("scale_type")
+                    and param["scale_type"] != _SCALE_TYPE_UNSPECIFIED
+                ):
+                    hps_type(
+                        name,
+                        min_value=values[0],
+                        max_value=values[-1],
+                        step=values[1] - values[0],
+                        sampling=_format_sampling(param["scale_type"]),
+                    )
+                else:
+                    hps_type(
+                        name,
+                        min_value=values[0],
+                        max_value=values[-1],
+                        step=values[1] - values[0],
+                    )
+            else:
+                hps.Choice(name, values)
         elif param["type"] == _CATEGORICAL:
             hps.Choice(name, param["categorical_value_spec"]["values"])
         elif param["type"] == _DOUBLE:
@@ -233,15 +271,8 @@ def _convert_hyperparams_to_optimizer_params(
             else:
                 param["type"] = _DISCRETE
                 param["discrete_value_spec"] = {"values": values}
-
         elif isinstance(hp, hp_module.Int):
-            if hp.step is not None and hp.step != 1:
-                # Note: hp.max_value is inclusive, while the end index of
-                # range() is exclusive, hence the +1
-                values = list(range(hp.min_value, hp.max_value + 1, hp.step))
-                param["type"] = _DISCRETE
-                param["discrete_value_spec"] = {"values": values}
-            else:
+            if hp.step is None or hp.step == 1:
                 param["type"] = _INTEGER
                 param["integer_value_spec"] = {
                     "min_value": hp.min_value,
@@ -249,14 +280,14 @@ def _convert_hyperparams_to_optimizer_params(
                 }
                 if hp.sampling is not None:
                     param.update(_get_scale_type(hp.sampling))
-        elif isinstance(hp, hp_module.Float):
-            if hp.step is not None:
-                # Match how KerasTuner generates the range
-                values = np.arange(
-                    hp.min_value, hp.max_value + 1e-7, step=hp.step)
+            else:
+                # Note: hp.max_value is inclusive, while the end index of
+                # range() is exclusive, hence the +1
+                values = list(range(hp.min_value, hp.max_value + 1, hp.step))
                 param["type"] = _DISCRETE
                 param["discrete_value_spec"] = {"values": values}
-            else:
+        elif isinstance(hp, hp_module.Float):
+            if hp.step is None:
                 param["type"] = _DOUBLE
                 param["double_value_spec"] = {
                     "min_value": hp.min_value,
@@ -264,6 +295,12 @@ def _convert_hyperparams_to_optimizer_params(
                 }
                 if hp.sampling is not None:
                     param.update(_get_scale_type(hp.sampling))
+            else:
+                # Match how KerasTuner generates the range
+                values = np.arange(
+                    hp.min_value, hp.max_value + 1e-7, step=hp.step).tolist()
+                param["type"] = _DISCRETE
+                param["discrete_value_spec"] = {"values": values}
         elif isinstance(hp, hp_module.Boolean):
             param["type"] = _CATEGORICAL
             param["categorical_value_spec"] = {"values": ["True", "False"]}
@@ -281,6 +318,63 @@ def _convert_hyperparams_to_optimizer_params(
         param_type.append(param)
 
     return param_type
+
+
+def convert_hyperparams_to_hparams(
+    hyperparams: hp_module.HyperParameters) -> Dict[hparams_api.HParam, Any]:
+    """Converts KerasTuner HyperParameters to TensorBoard HParams.
+
+    Args:
+        hyperparams: A KerasTuner HyperParameters instance
+
+    Returns:
+        A dict that maps TensorBoard HParams to current values.
+    """
+    hparams = {}
+    for hp in hyperparams.space:
+        hparams_value = {}
+        try:
+            hparams_value = hyperparams.get(hp.name)
+        except ValueError:
+            continue
+
+        hparams_domain = {}
+        if isinstance(hp, hp_module.Choice):
+            hparams_domain = hparams_api.Discrete(hp.values)
+        elif isinstance(hp, hp_module.Int):
+            if hp.step is None or hp.step == 1:
+                hparams_domain = hparams_api.IntInterval(
+                    hp.min_value, hp.max_value)
+            else:
+                # Note: `hp.max_value` is inclusive, unlike the end index
+                # of Python `range()`, which is exclusive
+                values = list(
+                    range(hp.min_value, hp.max_value + 1, hp.step))
+                hparams_domain = hparams_api.Discrete(values)
+        elif isinstance(hp, hp_module.Float):
+            if hp.step is None:
+                hparams_domain = hparams_api.RealInterval(
+                    hp.min_value, hp.max_value)
+            else:
+                # Note: `hp.max_value` is inclusive, which is also
+                # the default for Numpy's linspace
+                num_samples = int((hp.max_value - hp.min_value) / hp.step)
+                end_value = hp.min_value + (num_samples * hp.step)
+                values = np.linspace(
+                    hp.min_value, end_value, num_samples + 1).tolist()
+                hparams_domain = hparams_api.Discrete(values)
+        elif isinstance(hp, hp_module.Boolean):
+            hparams_domain = hparams_api.Discrete([True, False])
+        elif isinstance(hp, hp_module.Fixed):
+            hparams_domain = hparams_api.Discrete([hp.value])
+        else:
+            raise ValueError(
+                "`HyperParameter` type not recognized: {}".format(hp))
+
+        hparams_key = hparams_api.HParam(hp.name, hparams_domain)
+        hparams[hparams_key] = hparams_value
+
+    return hparams
 
 
 def format_objective(
@@ -413,6 +507,39 @@ def convert_optimizer_trial_to_hps(
     hps = hp_module.HyperParameters.from_config(hps.get_config())
     hps.values = convert_optimizer_trial_to_dict(optimizer_trial)
     return hps
+
+
+def convert_optimizer_trial_to_keras_trial(
+    optimizer_trial: Dict[Text, Any],
+    hyperparameter_space: hp_module.HyperParameters,
+) -> trial_module.Trial:
+    """Converts completed Optimizer Trial into KerasTuner Trial.
+
+    Arguments:
+        optimizer_trial: A CAIP Optimizer Trial Instance.
+        hyperparameter_space: Mandatory and must include definitions for all
+            hyperparameters used during the search.
+
+    Returns:
+        A KerasTuner Trial.
+    """
+    kerastuner_trial = trial_module.Trial(
+        hyperparameters=convert_optimizer_trial_to_hps(
+            hyperparameter_space, optimizer_trial
+        ),
+        trial_id=get_trial_id(optimizer_trial),
+        status=trial_module.TrialStatus.COMPLETED,
+    )
+    # If trial had ended before having intermediate metric reporting,
+    # set stepCount = 0.
+    final_measurement = optimizer_trial.get("finalMeasurement")
+    if not final_measurement:
+        raise ValueError('"finalMeasurement" not found in this trial {}'
+                         .format(optimizer_trial))
+
+    kerastuner_trial.best_step = final_measurement.get("stepCount", 0)
+    kerastuner_trial.score = final_measurement["metrics"][0].get("value")
+    return kerastuner_trial
 
 
 def _format_sampling(scale_type: Text) -> Optional[Text]:
